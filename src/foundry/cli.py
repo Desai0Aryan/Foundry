@@ -46,6 +46,11 @@ async def _create_user(email: str, name: str, tier: str) -> None:
 async def _service(name: str) -> None:
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_json)
+    from . import metrics
+
+    default_ports = {"worker": 9100, "relay": 9101, "reaper": 9102}
+    port = settings.metrics_port if settings.metrics_port is not None else default_ports[name]
+    metrics.start_exporter(port)  # 0 disables
     pool = await create_pool(settings)
     try:
         await run_migrations(pool)  # idempotent and advisory-locked, so replicas can race

@@ -9,6 +9,7 @@ WORKERS=${WORKERS:-3}
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 export FOUNDRY_DATABASE_URL=${FOUNDRY_DATABASE_URL:-postgresql://foundry:foundry@localhost:5432/foundry}
 export FOUNDRY_BROKER_URL=${FOUNDRY_BROKER_URL:-amqp://guest:guest@localhost:5672/}
+export FOUNDRY_REDIS_URL=${FOUNDRY_REDIS_URL:-redis://localhost:6379/0}
 export FOUNDRY_LEASE_SECONDS=${FOUNDRY_LEASE_SECONDS:-6}
 export FOUNDRY_HEARTBEAT_SECONDS=${FOUNDRY_HEARTBEAT_SECONDS:-2}
 export FOUNDRY_BACKOFF_BASE_SECONDS=${FOUNDRY_BACKOFF_BASE_SECONDS:-1}
@@ -27,8 +28,12 @@ case "${1:-up}" in
     start api python3 -m uvicorn foundry.api.app:app_factory --factory --port "${PORT:-8000}"
     start relay python3 -m foundry.cli relay
     start reaper python3 -m foundry.cli reaper
-    for i in $(seq "$WORKERS"); do start "worker$i" python3 -m foundry.cli worker; done
+    # each local worker needs its own metrics port (containers get one namespace each)
+    for i in $(seq "$WORKERS"); do
+      FOUNDRY_METRICS_PORT=$((9109 + i)) start "worker$i" python3 -m foundry.cli worker
+    done
     echo "started api, relay, reaper and $WORKERS workers (logs in $RUN_DIR/)"
+    echo "metrics: api :${PORT:-8000}/metrics  workers :9110+  relay :9101  reaper :9102"
     ;;
   down)
     for f in "$RUN_DIR"/*.pid; do

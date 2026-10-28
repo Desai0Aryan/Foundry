@@ -25,6 +25,19 @@ class Settings(BaseSettings):
 
     max_payload_bytes: int = 256 * 1024
 
+    # --- redis: rate limiting + quota counters ----------------------------------------
+    redis_url: str = "redis://localhost:6379/0"  # empty string disables Redis features
+    rate_limit_enabled: bool = True
+    rate_limit_burst_seconds: float = 2.0  # bucket capacity = rate * this (min 1 request)
+    rate_limit_fail_open: bool = True  # Redis down -> allow (availability over strictness)
+    auth_fail_limit_per_minute: int = 30  # bad-credential attempts per client IP
+    quota_enabled: bool = True
+
+    # --- metrics ----------------------------------------------------------------------
+    metrics_token: SecretStr | None = None  # if set, /metrics requires "Bearer <token>"
+    metrics_port: int | None = None  # worker / relay / reaper exporters (0 disables)
+    system_metrics_cache_seconds: float = 2.0
+
     # --- broker ---------------------------------------------------------------------
     broker_url: str = "amqp://guest:guest@localhost:5672/"
     broker_prefix: str = "foundry"  # names every exchange/queue; tests use a unique one

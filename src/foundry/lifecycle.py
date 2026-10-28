@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 from uuid import UUID
 
 import asyncpg
@@ -30,6 +30,12 @@ from .config import Settings
 log = logging.getLogger("foundry.lifecycle")
 
 FailOutcome = Literal["retry", "dead", "cancelled", "lost"]
+
+
+class Completion(NamedTuple):
+    """Truthy proof that a result was recorded, plus the user-visible latency."""
+
+    end_to_end_seconds: float
 
 
 def make_error(kind: str, message: str, attempt: int, *, retryable: bool) -> dict[str, Any]:
@@ -58,7 +64,7 @@ async def claim_job(
                    lease_expires_at = now() + make_interval(secs => $3),
                    started_at = COALESCE(started_at, now()), next_run_at = NULL
              WHERE id = $1 AND status = 'queued'
-            RETURNING *
+            RETURNING *, extract(epoch FROM now() - queued_at)::float8 AS queue_wait_seconds
             """,
             job_id, worker_id, float(lease_seconds),
         )  # fmt: skip
@@ -72,8 +78,8 @@ async def claim_job(
 # --------------------------------------------------------------------------- completion
 async def complete_job(
     pool: asyncpg.Pool, job_id: UUID, worker_id: str, attempt: int, result: Any
-) -> bool:
-    """True if the result was recorded; False if this attempt lost its lease (discard it)."""
+) -> Completion | None:
+    """A Completion if the result was recorded; None if this attempt lost its lease."""
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
             f"""
@@ -81,16 +87,16 @@ async def complete_job(
                SET status = 'succeeded', result = $4, error = NULL, finished_at = now(),
                    lease_owner = NULL, lease_expires_at = NULL
              WHERE {_OWNED}
-            RETURNING id
+            RETURNING extract(epoch FROM finished_at - created_at)::float8 AS e2e
             """,  # noqa: S608
             job_id, worker_id, attempt, result,
         )  # fmt: skip
         if row is None:
-            return False
+            return None
         await repo.add_event(
             conn, job_id, "running", "succeeded", {"worker": worker_id, "attempt": attempt}
         )
-        return True
+        return Completion(float(row["e2e"]))
 
 
 async def _settle_failure(
@@ -195,7 +201,7 @@ async def release_job(pool: asyncpg.Pool, job_id: UUID, worker_id: str, attempt:
     async with pool.acquire() as conn, conn.transaction():
         row = await conn.fetchrow(
             f"""
-            UPDATE jobs SET status = 'queued', attempts = attempts - 1,
+            UPDATE jobs SET status = 'queued', attempts = attempts - 1, queued_at = now(),
                    lease_owner = NULL, lease_expires_at = NULL
              WHERE {_OWNED} RETURNING id, type, priority
             """,  # noqa: S608
@@ -308,7 +314,9 @@ async def promote_due(pool: asyncpg.Pool, limit: int) -> int:
         )
         for row in rows:
             await conn.execute(
-                "UPDATE jobs SET status = 'queued', next_run_at = NULL WHERE id = $1", row["id"]
+                "UPDATE jobs SET status = 'queued', next_run_at = NULL, queued_at = now() "
+                "WHERE id = $1",
+                row["id"],
             )
             await repo.add_event(
                 conn, row["id"], "retry_scheduled", "queued", {"reason": "backoff_elapsed"}

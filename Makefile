@@ -31,6 +31,15 @@ local-up: ## Run api + relay + reaper + 3 workers as local processes (no Docker 
 local-down: ## Stop the local processes
 	./scripts/local_stack.sh down
 
+limits-demo: ## Tour of rate limits, quotas, concurrency limits and metrics
+	$(PY) scripts/demo_part3.py
+
+traffic: ## 60 s of mixed traffic to light up the Grafana dashboard
+	$(PY) scripts/demo_part3.py --traffic 60
+
+dashboard: ## Regenerate the Grafana dashboard JSON from ops/grafana/build_dashboard.py
+	$(PY) ops/grafana/build_dashboard.py
+
 crash-demo: ## Kill a worker mid-flight and watch jobs recover (stack must be running)
 	$(PY) scripts/demo_part2.py
 
@@ -38,10 +47,10 @@ test: ## Run unit + integration tests (needs FOUNDRY_TEST_DATABASE_URL or local 
 	$(PY) -m pytest
 
 lint: ## Lint and format-check
-	ruff check src tests && ruff format --check src tests
+	ruff check src tests scripts ops && ruff format --check src tests scripts ops
 
 fmt: ## Auto-format
-	ruff check --fix src tests && ruff format src tests
+	ruff check --fix src tests scripts ops && ruff format src tests scripts ops
 
 demo: ## Smoke-test the running API end to end
 	./scripts/demo_part1.sh

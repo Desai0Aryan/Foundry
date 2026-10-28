@@ -9,7 +9,7 @@ from ... import repository as repo
 from ...config import Settings
 from ...domain import TIER_LIMITS
 from ...errors import ApiError, not_found
-from ...schemas import MeOut, UserCreate, UserWithKey
+from ...schemas import MeOut, UserCreate, UserLimitsUpdate, UserWithKey
 from ...security import constant_time_equals, generate_api_key
 from ..deps import get_pool, get_settings
 
@@ -138,3 +138,31 @@ async def effects(pool: asyncpg.Pool = Depends(get_pool)) -> dict:
         "jobs_with_effects": row["jobs"],
         "duplicate_applications_suppressed": int(row["suppressed"]),
     }
+
+
+@router.patch("/users/{user_id}", response_model=MeOut, summary="Change a user's tier or limits")
+async def update_limits(
+    user_id: UUID, body: UserLimitsUpdate, pool: asyncpg.Pool = Depends(get_pool)
+) -> MeOut:
+    changes = body.model_dump(exclude_none=True)
+    if "tier" in changes and not {
+        "max_concurrent_jobs",
+        "daily_job_quota",
+        "rate_limit_per_sec",
+    } & set(changes):
+        concurrent, daily, rps = TIER_LIMITS[changes["tier"]]  # a tier change implies its defaults
+        changes.update(
+            max_concurrent_jobs=concurrent, daily_job_quota=daily, rate_limit_per_sec=rps
+        )
+    if not changes:
+        raise ApiError(400, "empty_update", "Nothing to update")
+    cols = list(changes)
+    assignments = ", ".join(f"{c} = ${i + 2}" for i, c in enumerate(cols))
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"UPDATE users SET {assignments} WHERE id = $1 RETURNING *",  # noqa: S608 - cols are a fixed schema allowlist
+            user_id, *changes.values(),
+        )  # fmt: skip
+    if row is None:
+        raise not_found("User")
+    return _me(row)

@@ -17,7 +17,7 @@ import aio_pika
 import asyncpg
 import orjson
 
-from . import broker
+from . import broker, metrics
 from .config import Settings
 from .runtime import install_stop_signals, sleep_or_stop
 
@@ -104,8 +104,10 @@ class OutboxRelay:
                     "UPDATE outbox SET attempts = attempts + 1, last_error = $2 WHERE id = $1",
                     outbox_id, err[:500],
                 )  # fmt: skip
+                metrics.OUTBOX_FAILURES.inc()
                 log.error("publish failed", extra={"outbox_id": outbox_id, "error": err[:200]})
         self.published_total += len(ok)
+        metrics.OUTBOX_PUBLISHED.inc(len(ok))
         if bad and not ok:
             raise ConnectionError(f"all {len(bad)} publishes failed: {bad[0][1]}")
         return len(ok)

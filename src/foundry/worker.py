@@ -28,7 +28,7 @@ import asyncpg
 import orjson
 from aio_pika.abc import AbstractIncomingMessage
 
-from . import broker, lifecycle
+from . import broker, lifecycle, metrics
 from .config import Settings
 from .handlers import HANDLERS, JobContext
 from .jobs_errors import PermanentError
@@ -49,6 +49,9 @@ class Worker:
         # job_id -> (attempt, running task). Cancelled by heartbeat / shutdown.
         self._active: dict[UUID, tuple[int, asyncio.Task[None]]] = {}
         self._cancel_reason: dict[UUID, str] = {}
+        # Jobs whose handler has finished and whose outcome is being written to PostgreSQL.
+        # They must never be interrupted: cancelling mid-transaction would roll the result back.
+        self._settling: set[UUID] = set()
         self._connection = None
         self._channel = None
         self._queue = None
@@ -119,24 +122,33 @@ class Worker:
             self._cancel_reason[job_id] = reason
             entry[1].cancel()
 
+    async def _heartbeat_once(self) -> None:
+        owned = [(jid, attempt) for jid, (attempt, _) in self._active.items()]
+        alive = await lifecycle.heartbeat(self.pool, self.id, owned, self.settings.lease_seconds)
+        for jid, _ in owned:
+            # The query was in flight while jobs kept running. A job that finished, or is
+            # writing its outcome right now, is absent from `alive` for a good reason: it
+            # is NOT a lost lease. (A synchronous check: nothing can change between it
+            # and the interrupt below, because there is no await in between.)
+            if jid in self._settling or jid not in self._active:
+                continue
+            if jid not in alive:
+                log.warning("lease lost; abandoning job", extra={"job_id": str(jid)})
+                metrics.LEASE_LOST.inc()
+                self._interrupt(jid, "lease_lost")
+            elif alive[jid]:
+                self._interrupt(jid, "cancel_requested")
+        await self._beat()
+
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self.settings.heartbeat_seconds)
             try:
-                owned = [(jid, attempt) for jid, (attempt, _) in self._active.items()]
-                alive = await lifecycle.heartbeat(
-                    self.pool, self.id, owned, self.settings.lease_seconds
-                )
-                for jid, _ in owned:
-                    if jid not in alive:
-                        log.warning("lease lost; abandoning job", extra={"job_id": str(jid)})
-                        self._interrupt(jid, "lease_lost")
-                    elif alive[jid]:
-                        self._interrupt(jid, "cancel_requested")
-                await self._beat()
+                await self._heartbeat_once()
             except Exception:
                 # Transient DB trouble: keep trying. If we stay silent past the lease the
                 # reaper will rescue our jobs and fencing will neutralise our late writes.
+                metrics.HEARTBEAT_FAILURES.inc()
                 log.exception("heartbeat failed")
 
     # ------------------------------------------------------------------------- messages
@@ -163,17 +175,22 @@ class Worker:
             return
 
         if job is None:  # duplicate, cancelled, or already finished: nothing to do
+            metrics.DUPLICATE_DELIVERIES.inc()
             await self._settle_message(message, "ack")
             return
+        metrics.JOB_QUEUE_WAIT.labels(job["type"]).observe(max(0.0, job["queue_wait_seconds"]))
 
         attempt = job["attempts"]
         runner = asyncio.create_task(self._run_job(job), name=f"job-{job_id}")
         self._active[job_id] = (attempt, runner)
+        metrics.WORKER_ACTIVE.set(len(self._active))
         try:
             await asyncio.wait({runner})  # never raises, even if `runner` was cancelled
         finally:
             self._active.pop(job_id, None)
             self._cancel_reason.pop(job_id, None)
+            self._settling.discard(job_id)
+            metrics.WORKER_ACTIVE.set(len(self._active))
         self.processed += 1
         await self._settle_message(message, "ack")
 
@@ -208,23 +225,33 @@ class Worker:
             async with asyncio.timeout(job["timeout_seconds"]):
                 result = await handler(ctx, job["payload"])
         except asyncio.CancelledError:
+            self._settling.add(job_id)
             reason = self._cancel_reason.get(job_id, "unknown")
             log.info("job interrupted", extra={**log_extra, "reason": reason})
-            await self._on_interrupted(job_id, attempt, reason)
+            self._observe_execution(job["type"], started)
+            await self._on_interrupted(job["type"], job_id, attempt, reason)
             return  # swallowed on purpose: the supervising coroutine just waits for us
         except TimeoutError:
+            self._settling.add(job_id)
+            self._observe_execution(job["type"], started)
             await self._on_failure(
                 job, attempt, "timeout", f"exceeded {job['timeout_seconds']}s timeout", True
             )
             return
         except PermanentError as exc:
+            self._settling.add(job_id)
+            self._observe_execution(job["type"], started)
             await self._on_failure(job, attempt, "permanent", str(exc), False)
             return
         except Exception as exc:
+            self._settling.add(job_id)
             log.warning("job failed", extra={**log_extra, "error": repr(exc)})
+            self._observe_execution(job["type"], started)
             await self._on_failure(job, attempt, type(exc).__name__, str(exc) or repr(exc), True)
             return
 
+        self._settling.add(job_id)
+        self._observe_execution(job["type"], started)
         try:
             recorded = await lifecycle.complete_job(self.pool, job_id, self.id, attempt, result)
         except Exception:
@@ -234,8 +261,11 @@ class Worker:
             return
         elapsed = asyncio.get_running_loop().time() - started
         if recorded:
+            metrics.JOBS_FINISHED.labels(job["type"], "succeeded").inc()
+            metrics.JOB_END_TO_END.labels(job["type"]).observe(recorded.end_to_end_seconds)
             log.info("job succeeded", extra={**log_extra, "seconds": round(elapsed, 3)})
         else:
+            metrics.JOBS_FINISHED.labels(job["type"], "lost").inc()
             log.warning("result discarded: lease lost to a newer attempt", extra=log_extra)
 
     async def _on_failure(
@@ -252,6 +282,7 @@ class Worker:
                 retryable=retryable,
                 settings=self.settings,
             )
+            metrics.JOBS_FINISHED.labels(job["type"], outcome).inc()
             log.info(
                 "job failure settled",
                 extra={"job_id": str(job["id"]), "outcome": outcome, "kind": kind},
@@ -261,13 +292,22 @@ class Worker:
                 "could not record failure; lease will expire", extra={"job_id": str(job["id"])}
             )
 
-    async def _on_interrupted(self, job_id: UUID, attempt: int, reason: str) -> None:
+    @staticmethod
+    def _observe_execution(job_type: str, started: float) -> None:
+        elapsed = asyncio.get_running_loop().time() - started
+        metrics.JOB_EXECUTION.labels(job_type).observe(elapsed)
+
+    async def _on_interrupted(self, job_type: str, job_id: UUID, attempt: int, reason: str) -> None:
         try:
             if reason == "cancel_requested":
-                await lifecycle.cancel_running(self.pool, job_id, self.id, attempt)
+                if await lifecycle.cancel_running(self.pool, job_id, self.id, attempt):
+                    metrics.JOBS_FINISHED.labels(job_type, "cancelled").inc()
             elif reason == "shutdown":
-                await lifecycle.release_job(self.pool, job_id, self.id, attempt)
-            # lease_lost: someone else owns the job now; writing anything would be wrong.
+                if await lifecycle.release_job(self.pool, job_id, self.id, attempt):
+                    metrics.JOBS_FINISHED.labels(job_type, "released").inc()
+            else:
+                # lease_lost: someone else owns the job now; writing anything would be wrong.
+                metrics.JOBS_FINISHED.labels(job_type, "lost").inc()
         except Exception:
             log.exception("could not settle interrupted job", extra={"job_id": str(job_id)})
 

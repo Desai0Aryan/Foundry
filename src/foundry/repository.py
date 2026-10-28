@@ -213,3 +213,10 @@ async def request_cancel(conn: asyncpg.Connection, job_id: UUID) -> asyncpg.Reco
     return await conn.fetchrow(
         "UPDATE jobs SET cancel_requested = true WHERE id = $1 RETURNING *", job_id
     )
+
+
+async def count_active(conn: asyncpg.Connection, user_id: UUID) -> int:
+    return await conn.fetchval(
+        "SELECT count(*) FROM jobs WHERE user_id = $1 AND status = ANY($2::text[])",
+        user_id, _ACTIVE,
+    )  # fmt: skip

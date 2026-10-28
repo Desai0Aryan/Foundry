@@ -80,3 +80,21 @@ class UserCreate(BaseModel):
 class UserWithKey(BaseModel):
     user: MeOut
     api_key: str = Field(description="Shown exactly once. Store it securely.")
+
+
+class UsageOut(BaseModel):
+    tier: str
+    rate_limit: dict[str, float | int]
+    daily_quota: dict[str, int | str]
+    concurrency: dict[str, int]
+
+
+class UserLimitsUpdate(BaseModel):
+    """Admin override of a user's plan. Limits apply from the very next request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tier: str | None = Field(default=None, pattern="^(free|pro|enterprise)$")
+    max_concurrent_jobs: int | None = Field(default=None, gt=0, le=100_000)
+    daily_job_quota: int | None = Field(default=None, gt=0, le=100_000_000)
+    rate_limit_per_sec: float | None = Field(default=None, gt=0, le=100_000)

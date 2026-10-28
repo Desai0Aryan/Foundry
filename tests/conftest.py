@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 
 import asyncpg
@@ -16,6 +17,9 @@ TEST_DSN = os.environ.get(
     "FOUNDRY_TEST_DATABASE_URL", "postgresql://postgres@localhost:5433/foundry_test"
 )
 BROKER_URL = os.environ.get("FOUNDRY_TEST_BROKER_URL", "amqp://guest:guest@localhost:5672/")
+REDIS_URL = os.environ.get(
+    "FOUNDRY_TEST_REDIS_URL", "redis://localhost:6379/15"
+)  # db 15: disposable
 ADMIN = {"X-Admin-Token": "test-admin"}
 
 
@@ -30,6 +34,7 @@ def make_settings(**overrides) -> Settings:
         "environment": "test",
         "db_pool_max": 30,
         "broker_url": BROKER_URL,
+        "redis_url": REDIS_URL,
         # fast timings so recovery behaviour can be tested in seconds
         "lease_seconds": 3.0,
         "heartbeat_seconds": 0.5,
@@ -72,6 +77,9 @@ async def app(_schema):
             await conn.execute(
                 "TRUNCATE users, api_keys, jobs, job_events, outbox, effect_ledger, workers CASCADE"
             )
+        if application.state.redis is not None:
+            with contextlib.suppress(Exception):  # tests also run (degraded) without Redis
+                await application.state.redis.flushdb()  # test db only (see REDIS_URL)
         yield application
 
 
@@ -80,6 +88,23 @@ async def client(app):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@contextlib.asynccontextmanager
+async def make_client(**overrides):
+    """A second app instance with different settings, sharing the already-prepared database."""
+    application = create_app(make_settings(**overrides))
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            c.app = application  # type: ignore[attr-defined]
+            yield c
+
+
+async def set_limits(client: httpx.AsyncClient, user_id: str, **limits):
+    r = await client.patch(f"/v1/admin/users/{user_id}", json=limits, headers=ADMIN)
+    assert r.status_code == 200, r.text
+    return r.json()
 
 
 async def make_user(client: httpx.AsyncClient, email: str = "ada@example.com", tier: str = "pro"):

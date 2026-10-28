@@ -424,3 +424,65 @@ async def test_admin_stats_and_workers(client, auth, app):
     )
     assert (await client.get("/v1/admin/stats")).status_code == 403
     assert dead is not None
+
+
+# ------------------------------------------------- heartbeat vs. a job that is settling
+async def test_heartbeat_never_interrupts_a_job_that_is_writing_its_outcome(client, auth, app):
+    """Regression: a heartbeat whose query was in flight while a job finished used to report
+    "lease lost" for it and cancel the task, which could abort the result write."""
+    from foundry import metrics
+    from foundry.worker import Worker
+
+    pool, settings = P(app)
+    worker = Worker(pool, settings, worker_id="w")  # never started: no broker needed
+    job_id = UUID(await submit(client, auth))
+    await lifecycle.claim_job(pool, job_id, "w", 30)
+    runner = asyncio.create_task(asyncio.sleep(60))
+    worker._active[job_id] = (1, runner)
+
+    # The job finishes while the heartbeat is "in flight": the DB no longer shows it running.
+    assert await lifecycle.complete_job(pool, job_id, "w", 1, {})
+    worker._settling.add(job_id)
+    lost_before = metrics.LEASE_LOST._value.get()
+    await worker._heartbeat_once()
+    await asyncio.sleep(0)
+    assert not runner.cancelled() and not runner.done()
+    assert metrics.LEASE_LOST._value.get() == lost_before  # not counted as a lost lease
+    assert job_id not in worker._cancel_reason
+
+    # A job that is NOT settling and really lost its lease is still abandoned promptly.
+    worker._settling.discard(job_id)
+    await worker._heartbeat_once()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    assert worker._cancel_reason[job_id] == "lease_lost"
+    assert metrics.LEASE_LOST._value.get() == lost_before + 1
+
+
+async def test_heartbeat_ignores_jobs_that_already_left_the_active_set(client, auth, app):
+    from foundry import metrics
+    from foundry.worker import Worker
+
+    pool, settings = P(app)
+    worker = Worker(pool, settings, worker_id="w")
+    ghost = UUID(int=42)
+    runner = asyncio.create_task(asyncio.sleep(60))
+    worker._active[ghost] = (1, runner)  # not running in the database at all
+    before = metrics.LEASE_LOST._value.get()
+    # snapshot taken, then the job is removed (finished) before the result is processed:
+    original = lifecycle.heartbeat
+
+    async def slow_heartbeat(*a, **kw):
+        out = await original(*a, **kw)
+        worker._active.pop(ghost, None)  # the job completes while the query was in flight
+        return out
+
+    lifecycle.heartbeat, saved = slow_heartbeat, lifecycle.heartbeat
+    try:
+        await worker._heartbeat_once()
+    finally:
+        lifecycle.heartbeat = saved
+    assert not runner.cancelled() and metrics.LEASE_LOST._value.get() == before
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner

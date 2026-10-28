@@ -9,12 +9,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from redis import asyncio as aioredis
 
-from .. import __version__
+from .. import __version__, metrics
 from ..config import Settings, get_settings
 from ..db import create_pool, run_migrations
 from ..errors import ApiError
 from ..logging_config import configure_logging
+from ..quota import QuotaManager
+from ..ratelimit import RateLimiter
+from ..security import constant_time_equals
 from .routes import admin, health, jobs
 
 log = logging.getLogger("foundry.api")
@@ -53,10 +58,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.pool = await create_pool(settings)
         if settings.auto_migrate:
             await run_migrations(app.state.pool)
+        redis = (
+            aioredis.from_url(
+                settings.redis_url,
+                socket_timeout=0.25,  # a slow Redis must never make the API slow
+                socket_connect_timeout=0.5,
+                decode_responses=True,
+            )
+            if settings.redis_url
+            else None
+        )
+        app.state.redis = redis
+        app.state.limiter = RateLimiter(redis, settings)
+        app.state.quotas = QuotaManager(redis, app.state.pool, settings)
         log.info("api started", extra={"version": __version__, "env": settings.environment})
         try:
             yield
         finally:
+            if redis is not None:
+                await redis.aclose()
             await app.state.pool.close()
 
     app = FastAPI(
@@ -80,8 +100,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception:
             log.exception("unhandled error", extra={"request_id": request.state.request_id})
             response = _problem(500, "internal_error", "Internal server error", None, request)
-        elapsed_ms = (time.perf_counter() - started) * 1000
+        elapsed = time.perf_counter() - started
+        elapsed_ms = elapsed * 1000
         response.headers["X-Request-ID"] = request.state.request_id
+        decision = getattr(request.state, "ratelimit", None)
+        if decision is not None:
+            for key, value in decision.headers().items():
+                response.headers.setdefault(key, value)
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", None) or "unmatched"  # template, not raw URL
+        if route_path != "/metrics":
+            metrics.HTTP_REQUESTS.labels(
+                request.method, route_path, str(response.status_code)
+            ).inc()
+            metrics.HTTP_LATENCY.labels(request.method, route_path).observe(elapsed)
         user = getattr(request.state, "user", None)
         log.info(
             "request",
@@ -106,6 +138,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
         errors = [{"loc": list(e["loc"]), "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
         return _problem(422, "validation_error", "Request validation failed", None, request, errors)
+
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics(request: Request) -> Response:
+        token = settings.metrics_token
+        if token is not None:
+            supplied = request.headers.get("authorization", "").removeprefix("Bearer ")
+            if not constant_time_equals(supplied, token.get_secret_value()):
+                return _problem(401, "unauthorized", "Unauthorized", None, request)
+        await metrics.refresh_system_gauges(app.state.pool, settings.system_metrics_cache_seconds)
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     app.include_router(health.router)
     app.include_router(jobs.router)

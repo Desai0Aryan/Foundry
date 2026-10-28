@@ -30,10 +30,10 @@ BOLD, DIM, GREEN, RED, YELLOW, RESET = (
 
 def call(method: str, url: str, headers: dict, body: dict | None = None):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)  # noqa: S310
+    req = urllib.request.Request(url, data=data, method=method)
     for k, v in {**headers, "Content-Type": "application/json"}.items():
         req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
+    with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read() or b"null")
 
 
@@ -99,7 +99,7 @@ def main() -> int:
     if where == "process":
         os.kill(victim["pid"], signal.SIGKILL)
     else:
-        subprocess.run(["docker", "kill", victim["host"]], check=True, capture_output=True)  # noqa: S603,S607
+        subprocess.run(["docker", "kill", victim["host"]], check=True, capture_output=True)
 
     print(
         f"{BOLD}4) Watch recovery{RESET}  {DIM}(lease expiry -> reaper -> backoff -> another worker){RESET}"

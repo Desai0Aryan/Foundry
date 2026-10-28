@@ -4,6 +4,7 @@ name: foundry
 x-env: &env
   FOUNDRY_DATABASE_URL: postgresql://foundry:foundry@postgres:5432/foundry
   FOUNDRY_BROKER_URL: amqp://guest:guest@rabbitmq:5672/
+  FOUNDRY_REDIS_URL: redis://redis:6379/0
   FOUNDRY_LEASE_SECONDS: ${FOUNDRY_LEASE_SECONDS:-10}      # crash recovery latency
   FOUNDRY_HEARTBEAT_SECONDS: ${FOUNDRY_HEARTBEAT_SECONDS:-3}
   FOUNDRY_BACKOFF_BASE_SECONDS: ${FOUNDRY_BACKOFF_BASE_SECONDS:-2}
@@ -25,7 +26,8 @@ services:
       timeout: 3s
       retries: 20
 
-  # Used from Part 3 (rate limiting / quotas); defined now so the topology is stable.
+  # Rate-limit buckets and daily-quota counters. Losing it is safe: counters are reseeded
+  # from PostgreSQL and the limiter fails open.
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
@@ -50,6 +52,7 @@ services:
     ports: ["8000:8000"]
     depends_on:
       postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
 
   # PostgreSQL -> RabbitMQ (transactional outbox). Safe to run more than one.
   relay:
@@ -84,6 +87,27 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
+
+  # ---- observability ------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports: ["9090:9090"]
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on: [api]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports: ["3000:3000"] # http://localhost:3000  (admin / admin, anonymous viewing enabled)
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/foundry.json
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
 
 volumes:
   pgdata:

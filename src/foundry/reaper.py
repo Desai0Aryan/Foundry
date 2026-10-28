@@ -14,7 +14,7 @@ import time
 
 import asyncpg
 
-from . import lifecycle
+from . import lifecycle, metrics
 from .config import Settings
 from .runtime import install_stop_signals, sleep_or_stop
 
@@ -32,6 +32,10 @@ class Reaper:
         s = self.settings
         reaped = await lifecycle.reap_expired(self.pool, s, s.reaper_batch_size)
         promoted = await lifecycle.promote_due(self.pool, s.reaper_batch_size)
+        for outcome, n in reaped.items():
+            if n:
+                metrics.REAPER_RECOVERED.labels(outcome).inc(n)
+        metrics.RETRIES_PROMOTED.inc(promoted)
         redriven = 0
         now = time.monotonic()
         if now - self._last_redrive > 30:
@@ -39,6 +43,7 @@ class Reaper:
             redriven = await lifecycle.redrive_stale(
                 self.pool, s.redrive_after_seconds, s.reaper_batch_size
             )
+            metrics.REDRIVEN.inc(redriven)
         if now - self._last_cleanup > 60:
             self._last_cleanup = now
             await lifecycle.cleanup(self.pool, s.outbox_retention_seconds)

@@ -27,8 +27,8 @@ Most "AI demos" are a model behind an endpoint. Real systems are mostly **failur
 | Part | Scope | Status |
 |-----:|-------|:------:|
 | 1 | Schema, auth, REST API, idempotency, dedup, transactional outbox, Docker stack | ✅ done |
-| 2 | Workers, RabbitMQ, retries + exponential backoff, timeouts, dead-letter queue, lease reaper, crash recovery | ✅ **done** |
-| 3 | Rate limiting, per-user quotas, Prometheus metrics, Grafana dashboards | ⏳ |
+| 2 | Workers, RabbitMQ, retries + exponential backoff, timeouts, dead-letter queue, lease reaper, crash recovery | ✅ done |
+| 3 | Rate limiting, per-user quotas, Prometheus metrics, Grafana dashboards | ✅ **done** |
 | 4 | Load tests, chaos / worker-crash recovery tests, exactly-once-effect proof | ⏳ |
 | 5 | Kubernetes manifests, CI polish, architecture docs, final demo | ⏳ |
 
@@ -46,7 +46,8 @@ flowchart LR
     W1 & W2 & W3 -->|"claim · heartbeat · fenced result"| PG
     RP[Reaper] -->|"expired leases → retry<br/>due retries → queue"| PG
     MQ -. "exhausted jobs" .-> DLQ{{Dead-letter queue}}
-    API -. "rate limit / quotas (Part 3)" .-> R[(Redis)]
+    API -->|"token bucket · daily quota"| R[(Redis)]
+    API & W1 & W2 & W3 & RP -. "/metrics" .-> PROM[(Prometheus)] --> GF[Grafana]
 ```
 
 **Key idea:** PostgreSQL owns *state*; the broker only carries *hints that work exists*. If the broker loses every message, the outbox and the lease reaper rebuild them. If a worker dies, its lease expires and another worker takes over.
@@ -89,6 +90,20 @@ Three mechanisms make this safe (see [ADR 0004](docs/adr/0004-leases-and-fencing
 
 > The handlers simulate heavy work (deterministic results, realistic timing) so the reliability machinery can be demonstrated anywhere. Swap in real conversion/transcoding/inference inside `handlers.py`; the contract (`ctx.effect`, `PermanentError`/`TransientError`) stays the same.
 
+## What Part 3 adds
+
+- **Rate limiting**: per-user token bucket in Redis (atomic Lua script, shared by all API replicas, uses Redis' clock). Standard `RateLimit-*` / `Retry-After` headers. Fails open if Redis is down (and alerts).
+- **Quotas**: daily job quota (Redis counter *seeded from PostgreSQL*, so a Redis flush never grants a fresh day) and an **exact** concurrent-jobs limit enforced under a per-user advisory lock. Only *created* jobs consume quota; idempotent retries of successful requests are always free, even when over quota.
+- **Abuse protection**: bad credentials are throttled per client IP, valid keys from the same IP are not.
+- **Plans**: `GET /v1/usage`, `PATCH /v1/admin/users/{id}` (changes apply on the next request).
+- **Metrics** (`/metrics`, plus `:9100/:9101/:9102` for workers, relay, reaper): throughput, queue depth, failure rate, and p50/p95/p99 for queue wait, execution and end-to-end latency, plus outbox lag, recovered jobs, limiter decisions.
+- **Prometheus + Grafana** pre-provisioned: a 24-panel dashboard and 12 alert rules (`ops/`). The dashboard is generated from code and **every query is executed against a live Prometheus** by `scripts/validate_dashboard.py` (32/32 return data).
+
+```bash
+make limits-demo     # watch 429s, quota and concurrency limits in action
+make traffic         # 60 s of mixed traffic; open http://localhost:3000 (Grafana)
+```
+
 ## What Part 1 gives you
 
 - **Authenticated REST API** — API keys stored as `HMAC-SHA256(pepper, secret)`, constant-time compare, key rotation, tier-based limits.
@@ -105,6 +120,7 @@ Three mechanisms make this safe (see [ADR 0004](docs/adr/0004-leases-and-fencing
 ```bash
 docker compose up --build -d          # Postgres, Redis, RabbitMQ, API, relay, reaper, 3 workers
 open http://localhost:8000/docs        # interactive OpenAPI
+open http://localhost:3000             # Grafana dashboard   (Prometheus: :9090)
 make demo                              # idempotency + dedup walkthrough
 make crash-demo                        # SIGKILL a busy worker, watch all jobs recover
 make scale N=8                         # resize the worker fleet
@@ -141,8 +157,9 @@ curl -s localhost:8000/v1/jobs/$JOB_ID/events -H "Authorization: Bearer $KEY"
 | `POST /v1/jobs/{id}/cancel` | Immediate for queued jobs, cooperative (`202`) for running ones |
 | `POST /v1/jobs/{id}/replay` | Re-run a dead-lettered job with a fresh attempt budget |
 | `GET /v1/job-types` | Discover job types and their JSON-Schema payloads |
-| `GET /v1/me` | Your tier and limits |
-| `POST /v1/admin/users` · `/users/{id}/api-keys` | Provision users, rotate keys (admin token) |
+| `GET /v1/me` · `/v1/usage` | Your tier and limits · current consumption (rate, daily quota, concurrency) |
+| `GET /metrics` | Prometheus metrics (optional bearer token via `FOUNDRY_METRICS_TOKEN`) |
+| `POST /v1/admin/users` · `/users/{id}/api-keys` · `PATCH /users/{id}` | Provision users, rotate keys, change plan limits (admin token) |
 | `GET /v1/admin/workers` · `/stats` · `/effects` | Fleet liveness · queue depth & DLQ size · side-effect ledger summary (admin) |
 | `GET /healthz` · `/readyz` | Liveness · readiness (checks PostgreSQL) |
 
@@ -154,12 +171,13 @@ Job types: `document.convert`, `video.transcode`, `ml.inference`, `demo.sleep` (
 make install        # editable install + dev tools
 make infra          # just the backing services
 make dev            # API with auto-reload
-make test           # 111 tests: unit + integration (real PostgreSQL + RabbitMQ, no mocks)
+make test           # 150 tests: unit + integration (real PostgreSQL, Redis, RabbitMQ; no mocks)
 make local-up       # run everything as local processes (no Docker for the apps)
 make lint
 ```
 
-Integration tests need PostgreSQL (`FOUNDRY_TEST_DATABASE_URL`, default
+Integration tests need Redis (`FOUNDRY_TEST_REDIS_URL`, default `redis://localhost:6379/15`, a disposable
+db that is flushed between tests) as well as PostgreSQL (`FOUNDRY_TEST_DATABASE_URL`, default
 `postgresql://postgres@localhost:5433/foundry_test`) and, for the end-to-end/crash tests,
 RabbitMQ (`FOUNDRY_TEST_BROKER_URL`, default `amqp://guest:guest@localhost:5672/`). Each run uses
 its own uniquely-named exchanges and queues. Tests skip cleanly if a service is unreachable.
@@ -178,6 +196,10 @@ src/foundry/
   broker.py       exchange / queue / DLX topology
   handlers.py     job handlers + JobContext (effect ledger)
   backoff.py      exponential backoff with jitter
+  ratelimit.py    Redis token bucket + credential-guessing guard
+  quota.py        daily quota (Redis, seeded from PostgreSQL)
+  metrics.py      Prometheus metrics and DB-derived system gauges
+ops/              Prometheus config + alert rules, Grafana provisioning + dashboard generator
   repository.py   every SQL statement lives here
   domain.py       state machine, tier limits, canonical hashing
   jobtypes.py     payload schemas + per-type defaults (extend here)
@@ -189,4 +211,4 @@ tests/            unit + integration
 
 ## Design decisions
 
-Short ADRs in [`docs/adr`](docs/adr): PostgreSQL as the source of truth, the transactional outbox, idempotency semantics, leases + fencing, and retries / DLQ.
+Short ADRs in [`docs/adr`](docs/adr): PostgreSQL as the source of truth, the transactional outbox, idempotency semantics, leases + fencing, retries / DLQ, rate limits & quotas, and metrics.

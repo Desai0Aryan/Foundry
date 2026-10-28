@@ -19,6 +19,7 @@ from uuid import UUID
 import asyncpg
 from pydantic import ValidationError
 
+from . import metrics
 from . import repository as repo
 from .domain import JobStatus, canonical_json, sha256_hex
 from .errors import ApiError, not_found
@@ -95,11 +96,36 @@ def prepare_job(body: JobCreate, max_payload_bytes: int) -> PreparedJob:
     )
 
 
-async def submit_job(
+async def has_existing_job(
     pool: asyncpg.Pool, user_id: UUID, job: PreparedJob, idempotency_key: str | None
+) -> bool:
+    """Would this submission resolve to an existing job (replay / dedup) instead of a new one?
+
+    Used so that an over-quota user can still safely retry a request that already succeeded.
+    """
+    async with pool.acquire() as conn:
+        if idempotency_key and await repo.get_by_idempotency_key(conn, user_id, idempotency_key):
+            return True
+        if job.dedup_key:
+            return await repo.get_active_by_dedup_key(conn, user_id, job.dedup_key) is not None
+    return False
+
+
+async def submit_job(
+    pool: asyncpg.Pool,
+    user_id: UUID,
+    job: PreparedJob,
+    idempotency_key: str | None,
+    max_concurrent: int | None = None,
 ) -> SubmitResult:
     for _ in range(_MAX_ATTEMPTS_BEFORE_GIVING_UP):
         async with pool.acquire() as conn, conn.transaction():
+            if max_concurrent is not None:
+                # Serialize this user's submissions so the concurrency limit is exact, not
+                # "approximately right under a burst". Other users are unaffected.
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", str(user_id)
+                )
             try:
                 # Nested transaction == SAVEPOINT: a unique violation rolls back only the
                 # INSERT, leaving the outer transaction usable so we can read the winner.
@@ -137,6 +163,15 @@ async def submit_job(
                     return SubmitResult(existing, "deduplicated")
                 raise
 
+            if max_concurrent is not None:
+                active = await repo.count_active(conn, user_id)  # includes the row just inserted
+                if active > max_concurrent:
+                    metrics.LIMIT_REJECTIONS.labels("concurrency").inc()
+                    raise ApiError(  # raising rolls the INSERT back
+                        429, "concurrency_limit", "Too many active jobs",
+                        f"Your plan allows {max_concurrent} jobs queued or running at once.",
+                        headers={"Retry-After": "5"},
+                    )  # fmt: skip
             await repo.add_event(
                 conn, row["id"], None, JobStatus.QUEUED.value, {"reason": "submitted"}
             )
@@ -195,7 +230,8 @@ async def replay_job(pool: asyncpg.Pool, user_id: UUID, job_id: UUID) -> asyncpg
             async with conn.transaction():
                 updated = await conn.fetchrow(
                     "UPDATE jobs SET status = 'queued', attempts = 0, result = NULL, "
-                    "error = NULL, started_at = NULL, finished_at = NULL, next_run_at = NULL, "
+                    "queued_at = now(), error = NULL, started_at = NULL, finished_at = NULL, "
+                    "next_run_at = NULL, "
                     "cancel_requested = false WHERE id = $1 RETURNING *",
                     job_id,
                 )  # fmt: skip

@@ -371,3 +371,67 @@ async def _events_full(app, job_id):
 async def _aiter(items):
     for i in items:
         yield i
+
+
+# ------------------------------------------------------------------------------ metrics
+def _sample(name: str, **labels) -> float:
+    from prometheus_client import REGISTRY
+
+    return REGISTRY.get_sample_value(name, labels) or 0.0
+
+
+async def test_worker_relay_and_reaper_emit_metrics(client, auth, app, stack):
+    names = {
+        "ok": ("foundry_jobs_finished_total", {"type": "demo.sleep", "outcome": "succeeded"}),
+        "retry": ("foundry_jobs_finished_total", {"type": "demo.sleep", "outcome": "retry"}),
+        "dead": ("foundry_jobs_finished_total", {"type": "demo.sleep", "outcome": "dead"}),
+        "exec": ("foundry_job_execution_seconds_count", {"type": "demo.sleep"}),
+        "wait": ("foundry_job_queue_wait_seconds_count", {"type": "demo.sleep"}),
+        "e2e": ("foundry_job_end_to_end_seconds_count", {"type": "demo.sleep"}),
+        "e2e_sum": ("foundry_job_end_to_end_seconds_sum", {"type": "demo.sleep"}),
+        "published": ("foundry_outbox_published_total", {}),
+        "promoted": ("foundry_retries_promoted_total", {}),
+    }
+    base = {k: _sample(n, **lbl) for k, (n, lbl) in names.items()}
+    delta = lambda k: _sample(names[k][0], **names[k][1]) - base[k]  # noqa: E731
+
+    await stack.start_relay()
+    await stack.start_reaper()
+    await stack.start_worker("w1")
+    ok_ids = [await submit(client, auth, payload={"seconds": 0.1}) for _ in range(5)]
+    bad = await submit(
+        client, auth, payload={"seconds": 0, "fail_probability": 1.0}, max_attempts=2
+    )
+    for jid in ok_ids:
+        await stack.wait_status(jid, {"succeeded"})
+    await stack.wait_status(bad, {"dead"})
+
+    async def converged():  # metrics are bumped just after the DB commit; give them a moment
+        return (
+            delta("ok") == 5
+            and delta("dead") == 1
+            and delta("published") >= 8
+            and delta("e2e") == 5
+        )
+
+    await wait_until(converged, 10)
+    assert delta("ok") == 5 and delta("retry") == 1 and delta("dead") == 1
+    assert delta("exec") == 7  # 5 successes + 2 failed attempts
+    assert delta("wait") == 7  # every claim records how long the job waited
+    assert delta("e2e") == 5  # end-to-end is observed for successes only
+    assert delta("e2e_sum") >= 5 * 0.1  # can't be faster than the work itself
+    assert delta("promoted") == 1
+    assert delta("published") >= 8  # 6 submissions + 1 retry + 1 dead-letter notice
+
+
+async def test_reaper_counts_recovered_jobs(client, auth, app, stack):
+    from foundry import lifecycle
+
+    before = _sample("foundry_reaper_recovered_total", outcome="retry")
+    job_id = UUID(await submit(client, auth))
+    await lifecycle.claim_job(app.state.pool, job_id, "doomed", 30)
+    async with app.state.pool.acquire() as c:
+        await c.execute("UPDATE jobs SET lease_expires_at = now() - interval '1 second'")
+    stats = await Reaper(app.state.pool, stack.settings).tick()
+    assert stats["recovered"] == 1
+    assert _sample("foundry_reaper_recovered_total", outcome="retry") - before == 1

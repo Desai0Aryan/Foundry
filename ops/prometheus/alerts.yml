@@ -1,0 +1,102 @@
+groups:
+  # Pre-computed series: cheap to graph and alert on.
+  - name: foundry-recording
+    interval: 15s
+    rules:
+      - record: foundry:job_end_to_end_seconds:p95
+        expr: histogram_quantile(0.95, sum by (le) (rate(foundry_job_end_to_end_seconds_bucket[2m])))
+      - record: foundry:job_attempt_failure_ratio
+        expr: >
+          sum(rate(foundry_jobs_finished_total{outcome=~"retry|dead"}[5m]))
+          / sum(rate(foundry_jobs_finished_total{outcome=~"succeeded|retry|dead"}[5m]))
+
+  - name: foundry-alerts
+    rules:
+      - alert: FoundryTargetDown
+        expr: up{job=~"foundry-.*"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.job }} target {{ $labels.instance }} is down"
+
+      - alert: FoundryNoWorkers
+        expr: max(foundry_workers_alive) == 0 and max(foundry_jobs{status="queued"}) > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Jobs are queued but no worker is alive"
+          description: "Start workers or check `docker compose logs worker`."
+
+      - alert: FoundryQueueBacklogGrowing
+        expr: max(foundry_queue_oldest_age_seconds) > 300
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Oldest queued job has waited {{ $value | humanizeDuration }}"
+          description: "Scale the worker fleet: `make scale N=8`."
+
+      - alert: FoundryDeadLetterJobs
+        expr: max(foundry_jobs{status="dead"}) > 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value }} job(s) exhausted retries and sit in the dead-letter queue"
+          description: "Inspect with GET /v1/jobs?status=dead, fix the cause, then POST /v1/jobs/{id}/replay."
+
+      - alert: FoundryHighAttemptFailureRate
+        expr: foundry:job_attempt_failure_ratio > 0.25
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of job attempts are failing"
+
+      - alert: FoundryLatencyP95High
+        expr: foundry:job_end_to_end_seconds:p95 > 60
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p95 submit-to-success latency is {{ $value | humanizeDuration }}"
+
+      - alert: FoundryOutboxLagging
+        expr: max(foundry_outbox_lag_seconds) > 30
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Outbox relay is {{ $value | humanizeDuration }} behind"
+          description: "Is the relay running? Is RabbitMQ reachable?"
+
+      - alert: FoundryOutboxStuck
+        expr: max(foundry_outbox_stuck) > 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Outbox rows exhausted their publish attempts (unroutable messages?)"
+
+      - alert: FoundryWorkerLeaseLoss
+        expr: sum(increase(foundry_worker_lease_lost_total[10m])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "Workers are losing leases: stalls, overload or heartbeat failures"
+
+      - alert: FoundryRateLimiterDegraded
+        expr: sum(increase(foundry_rate_limit_decisions_total{result=~"error.*"}[5m])) > 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Rate limiter cannot reach Redis (failing open unless configured otherwise)"
+
+      - alert: FoundryCredentialGuessing
+        expr: sum(rate(foundry_auth_failures_total[5m])) > 5
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 5 rejected API credentials per second"
+
+      - alert: FoundryApiErrors
+        expr: >
+          sum(rate(foundry_http_requests_total{status=~"5.."}[5m]))
+          / sum(rate(foundry_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "More than 5% of API responses are 5xx"
