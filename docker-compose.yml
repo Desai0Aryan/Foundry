@@ -1,0 +1,52 @@
+# One command brings up the whole platform:   docker compose up --build
+name: foundry
+
+x-env: &env
+  FOUNDRY_DATABASE_URL: postgresql://foundry:foundry@postgres:5432/foundry
+  FOUNDRY_ADMIN_TOKEN: ${FOUNDRY_ADMIN_TOKEN:-dev-admin-token-change-me}
+  FOUNDRY_API_KEY_PEPPER: ${FOUNDRY_API_KEY_PEPPER:-dev-pepper-change-me}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: foundry
+      POSTGRES_PASSWORD: foundry
+      POSTGRES_DB: foundry
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U foundry -d foundry"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Used from Part 2 (broker) and Part 3 (rate limiting / quotas). Defined now so the
+  # stack topology is stable from day one.
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports: ["5672:5672", "15672:15672"] # 15672 = management UI (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  api:
+    build: .
+    environment: *env
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  pgdata:
