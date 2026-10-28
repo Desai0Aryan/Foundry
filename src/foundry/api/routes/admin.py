@@ -83,3 +83,58 @@ async def issue_key(
             conn, user_id=user_id, prefix=key.prefix, secret_hash=key.secret_hash, label="rotated"
         )
     return {"api_key": key.token}
+
+
+@router.get("/workers", summary="Worker fleet: liveness, load and throughput")
+async def workers(pool: asyncpg.Pool = Depends(get_pool)) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, host, pid, status, concurrency, active_jobs, processed_total,
+                   started_at, last_heartbeat_at,
+                   (status <> 'stopped' AND last_heartbeat_at > now() - interval '30 seconds')
+                       AS alive
+              FROM workers ORDER BY started_at DESC LIMIT 200
+            """
+        )
+    return [dict(r) for r in rows]
+
+
+@router.get("/stats", summary="Queue depth, dead-letter count and backlog age")
+async def stats(pool: asyncpg.Pool = Depends(get_pool)) -> dict:
+    async with pool.acquire() as conn:
+        by_status = {
+            r["status"]: r["n"]
+            for r in await conn.fetch("SELECT status, count(*) AS n FROM jobs GROUP BY status")
+        }
+        outbox_backlog = await conn.fetchval(
+            "SELECT count(*) FROM outbox WHERE published_at IS NULL AND attempts < 10"
+        )
+        outbox_stuck = await conn.fetchval(
+            "SELECT count(*) FROM outbox WHERE published_at IS NULL AND attempts >= 10"
+        )
+        oldest = await conn.fetchval(
+            "SELECT extract(epoch FROM now() - min(created_at)) FROM jobs WHERE status = 'queued'"
+        )
+    return {
+        "jobs_by_status": by_status,
+        "queue_depth": by_status.get("queued", 0),
+        "dead_letter_count": by_status.get("dead", 0),
+        "outbox_backlog": outbox_backlog,
+        "outbox_stuck": outbox_stuck,
+        "oldest_queued_age_seconds": float(oldest) if oldest is not None else 0.0,
+    }
+
+
+@router.get("/effects", summary="Side-effect ledger summary (duplicate-suppression proof)")
+async def effects(pool: asyncpg.Pool = Depends(get_pool)) -> dict:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT count(*) AS effects, count(DISTINCT job_id) AS jobs, "
+            "COALESCE(sum(suppressed), 0) AS suppressed FROM effect_ledger"
+        )
+    return {
+        "effects_applied": row["effects"],
+        "jobs_with_effects": row["jobs"],
+        "duplicate_applications_suppressed": int(row["suppressed"]),
+    }

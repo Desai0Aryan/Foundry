@@ -22,6 +22,18 @@ dev: ## Run the API locally with auto-reload (needs Postgres from `make infra`)
 infra: ## Start only the backing services
 	docker compose up -d postgres redis rabbitmq
 
+scale: ## Scale the worker fleet, e.g. `make scale N=8`
+	docker compose up -d --scale worker=$(or $(N),6)
+
+local-up: ## Run api + relay + reaper + 3 workers as local processes (no Docker for the apps)
+	./scripts/local_stack.sh up
+
+local-down: ## Stop the local processes
+	./scripts/local_stack.sh down
+
+crash-demo: ## Kill a worker mid-flight and watch jobs recover (stack must be running)
+	$(PY) scripts/demo_part2.py
+
 test: ## Run unit + integration tests (needs FOUNDRY_TEST_DATABASE_URL or local Postgres)
 	$(PY) -m pytest
 

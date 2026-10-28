@@ -15,6 +15,7 @@ from foundry.db import create_pool, run_migrations
 TEST_DSN = os.environ.get(
     "FOUNDRY_TEST_DATABASE_URL", "postgresql://postgres@localhost:5433/foundry_test"
 )
+BROKER_URL = os.environ.get("FOUNDRY_TEST_BROKER_URL", "amqp://guest:guest@localhost:5672/")
 ADMIN = {"X-Admin-Token": "test-admin"}
 
 
@@ -28,6 +29,16 @@ def make_settings(**overrides) -> Settings:
         "log_level": "WARNING",
         "environment": "test",
         "db_pool_max": 30,
+        "broker_url": BROKER_URL,
+        # fast timings so recovery behaviour can be tested in seconds
+        "lease_seconds": 3.0,
+        "heartbeat_seconds": 0.5,
+        "backoff_base_seconds": 0.2,
+        "backoff_cap_seconds": 1.0,
+        "reaper_interval_seconds": 0.2,
+        "outbox_poll_seconds": 0.2,
+        "worker_concurrency": 4,
+        "shutdown_grace_seconds": 5.0,
     }
     return Settings(**{**base, **overrides})
 
@@ -59,7 +70,7 @@ async def app(_schema):
     async with application.router.lifespan_context(application):
         async with application.state.pool.acquire() as conn:
             await conn.execute(
-                "TRUNCATE users, api_keys, jobs, job_events, outbox, effect_ledger CASCADE"
+                "TRUNCATE users, api_keys, jobs, job_events, outbox, effect_ledger, workers CASCADE"
             )
         yield application
 
@@ -90,3 +101,21 @@ def sleep_job(**overrides):
     body = {"type": "demo.sleep", "payload": {"seconds": 0.1}}
     body.update(overrides)
     return body
+
+
+async def submit(client: httpx.AsyncClient, auth: dict, **overrides) -> str:
+    r = await client.post("/v1/jobs", json=sleep_job(**overrides), headers=auth)
+    assert r.status_code in (200, 201), r.text
+    return r.json()["id"]
+
+
+async def wait_until(predicate, timeout: float = 15.0, interval: float = 0.05):
+    """Poll an async predicate until it returns a truthy value, or fail loudly."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        value = await predicate()
+        if value:
+            return value
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not met within timeout")
+        await asyncio.sleep(interval)

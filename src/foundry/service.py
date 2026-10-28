@@ -178,3 +178,37 @@ async def cancel_job(
             409, "not_cancellable", "Job cannot be cancelled",
             f"Job is already {status.value}.",
         )  # fmt: skip
+
+
+async def replay_job(pool: asyncpg.Pool, user_id: UUID, job_id: UUID) -> asyncpg.Record:
+    """Dead-letter replay: give a dead job a fresh attempt budget and put it back on the queue."""
+    async with pool.acquire() as conn, conn.transaction():
+        row = await repo.lock_job(conn, user_id, job_id)
+        if row is None:
+            raise not_found("Job")
+        if row["status"] != JobStatus.DEAD.value:
+            raise ApiError(
+                409, "not_replayable", "Job cannot be replayed",
+                f"Only dead jobs can be replayed; this one is {row['status']}.",
+            )  # fmt: skip
+        try:
+            async with conn.transaction():
+                updated = await conn.fetchrow(
+                    "UPDATE jobs SET status = 'queued', attempts = 0, result = NULL, "
+                    "error = NULL, started_at = NULL, finished_at = NULL, next_run_at = NULL, "
+                    "cancel_requested = false WHERE id = $1 RETURNING *",
+                    job_id,
+                )  # fmt: skip
+        except asyncpg.UniqueViolationError as exc:
+            raise ApiError(
+                409, "duplicate_active_job", "An identical job is already active",
+                "Replay would violate deduplication: an equal job is still queued or running.",
+            ) from exc  # fmt: skip
+        await repo.add_event(conn, job_id, "dead", "queued", {"reason": "replayed"})
+        await repo.add_outbox(
+            conn,
+            job_id,
+            row["type"],
+            {"job_id": str(job_id), "type": row["type"], "priority": row["priority"]},
+        )
+        return updated

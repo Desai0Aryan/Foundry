@@ -143,3 +143,16 @@ async def cancel_job(
     if not immediate:
         response.status_code = 202
     return JobOut.model_validate(dict(row))
+
+
+@router.post(
+    "/jobs/{job_id}/replay",
+    response_model=JobOut,
+    status_code=202,
+    summary="Replay a dead (dead-lettered) job with a fresh attempt budget",
+)
+async def replay_job(
+    job_id: UUID, user: AuthUser = Depends(current_user), pool: asyncpg.Pool = Depends(get_pool)
+) -> JobOut:
+    row = await service.replay_job(pool, user.id, job_id)
+    return JobOut.model_validate(dict(row))
