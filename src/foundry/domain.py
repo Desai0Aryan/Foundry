@@ -31,6 +31,7 @@ TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
             JobStatus.RETRY_SCHEDULED,  # failed or lease expired, attempts remain
             JobStatus.DEAD,  # failed, attempts exhausted
             JobStatus.CANCELLED,
+            JobStatus.QUEUED,  # released by a worker that is shutting down gracefully
         }
     ),
     JobStatus.RETRY_SCHEDULED: frozenset({JobStatus.QUEUED, JobStatus.CANCELLED}),

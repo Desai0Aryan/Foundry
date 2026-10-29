@@ -75,7 +75,8 @@ async def app(_schema):
     async with application.router.lifespan_context(application):
         async with application.state.pool.acquire() as conn:
             await conn.execute(
-                "TRUNCATE users, api_keys, jobs, job_events, outbox, effect_ledger, workers CASCADE"
+                "TRUNCATE users, api_keys, jobs, job_events, outbox, effect_ledger, workers, "
+                "external_effects CASCADE"
             )
         if application.state.redis is not None:
             with contextlib.suppress(Exception):  # tests also run (degraded) without Redis

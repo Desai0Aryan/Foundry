@@ -212,3 +212,17 @@ tests/            unit + integration
 ## Design decisions
 
 Short ADRs in [`docs/adr`](docs/adr): PostgreSQL as the source of truth, the transactional outbox, idempotency semantics, leases + fencing, retries / DLQ, rate limits & quotas, and metrics.
+
+
+## Load testing, chaos and proof (Part 4)
+
+```bash
+make loadtest RATE=100 DURATION=30    # open-loop load generator: p50/p95/p99, throughput, queue depth
+make chaos SCENARIO=kitchen-sink      # kill workers, freeze a zombie, kill relay/reaper, stop RabbitMQ
+make audit                            # verify every invariant from the database alone
+make test-chaos                       # the same, as pytest (real processes, real signals)
+```
+
+Scenarios: `worker-crash`, `worker-freeze`, `rolling-restart`, `control-plane-crash`,
+`broker-outage`, `kitchen-sink`. Each ends with an audit; a violation exits non-zero.
+Results and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md). Design: [ADR 0008](docs/adr/0008-prove-dont-claim.md).

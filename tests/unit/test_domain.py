@@ -29,6 +29,7 @@ def test_active_and_terminal_partition_all_statuses():
         (JobStatus.RUNNING, JobStatus.DEAD),
         (JobStatus.RETRY_SCHEDULED, JobStatus.QUEUED),
         (JobStatus.DEAD, JobStatus.QUEUED),  # DLQ replay
+        (JobStatus.RUNNING, JobStatus.QUEUED),  # graceful worker shutdown hands the job back
     ],
 )
 def test_legal_transitions(src, dst):

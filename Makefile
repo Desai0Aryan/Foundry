@@ -43,6 +43,18 @@ dashboard: ## Regenerate the Grafana dashboard JSON from ops/grafana/build_dashb
 crash-demo: ## Kill a worker mid-flight and watch jobs recover (stack must be running)
 	$(PY) scripts/demo_part2.py
 
+loadtest: ## Open-loop load test against the running stack (RATE=50 DURATION=30)
+	$(PY) -m foundry.cli loadtest --rate $${RATE:-50} --duration $${DURATION:-30} --output .run/loadtest.json
+
+chaos: ## Load test + fault injection + invariant audit (SCENARIO=kitchen-sink; spawns its own fleet)
+	$(PY) -m foundry.cli chaos $${SCENARIO:-worker-crash} --duration 40 --output .run/chaos.json
+
+audit: ## Verify every invariant from the database alone
+	$(PY) -m foundry.cli audit
+
+test-chaos: ## Slow end-to-end fault-injection tests
+	$(PY) -m pytest -m chaos tests/chaos
+
 test: ## Run unit + integration tests (needs FOUNDRY_TEST_DATABASE_URL or local Postgres)
 	$(PY) -m pytest
 

@@ -56,6 +56,29 @@ class JobContext:
             )  # fmt: skip
         return bool(row["inserted"])
 
+    async def deliver(self, effect_key: str) -> bool:
+        """Call an external system, passing a stable idempotency key.
+
+        The receiver (``external_effects``) applies the effect once per key and counts every
+        delivery. Returns True if this delivery was the first. This is the standard way to get
+        effectively-once behaviour out of at-least-once execution: a crash right after the call
+        and before the job is marked done means the retry delivers again, and the receiver
+        absorbs it.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO external_effects
+                    (idempotency_key, job_id, effect_key, first_attempt, first_worker)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (idempotency_key)
+                DO UPDATE SET deliveries = external_effects.deliveries + 1, last_at = now()
+                RETURNING (xmax = 0) AS first
+                """,
+                self.idempotency_key(effect_key), self.job_id, effect_key, self.attempt, self.worker_id,
+            )  # fmt: skip
+        return bool(row["first"])
+
     async def work(self, seconds: float) -> None:
         await asyncio.sleep(seconds / self.sim_speed)
 
@@ -71,8 +94,15 @@ async def demo_sleep(ctx: JobContext, p: dict[str, Any]) -> dict[str, Any]:
     await asyncio.sleep(p["seconds"])  # exact: the demos rely on predictable durations
     if p["fail_probability"] and random.random() < p["fail_probability"]:  # noqa: S311
         raise TransientError("injected failure")
-    applied = await ctx.effect(p.get("side_effect_key") or "demo-effect")
-    return {"slept_seconds": p["seconds"], "effect_applied": applied, "worker": ctx.worker_id}
+    key = p.get("side_effect_key") or "demo-effect"
+    first_delivery = await ctx.deliver(key)  # the "external call"; a crash after it is survivable
+    applied = await ctx.effect(key)  # local ledger: recorded atomically in PostgreSQL
+    return {
+        "slept_seconds": p["seconds"],
+        "effect_applied": applied,
+        "first_delivery": first_delivery,
+        "worker": ctx.worker_id,
+    }
 
 
 async def document_convert(ctx: JobContext, p: dict[str, Any]) -> dict[str, Any]:

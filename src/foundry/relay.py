@@ -25,6 +25,16 @@ log = logging.getLogger("foundry.relay")
 MAX_PUBLISH_ATTEMPTS = 10
 
 
+def is_infrastructure_error(exc: BaseException) -> bool:
+    """Anything except a failure caused by the message itself is the broker's problem.
+
+    Allow-list the message-specific errors (unroutable, unserialisable) rather than
+    enumerating connection errors: aio-pika, aiormq and the stdlib each have their own
+    hierarchy (e.g. ChannelInvalidStateError) and a missed one would park work forever.
+    """
+    return not isinstance(exc, UnroutableError | ValueError | TypeError)
+
+
 class UnroutableError(Exception):
     """The broker accepted the message but no queue is bound to its routing key."""
 
@@ -97,12 +107,20 @@ class OutboxRelay:
                 for r, res in zip(rows, results, strict=True)
                 if res is not None
             ]
+            infra_failed = {
+                r["id"]
+                for r, res in zip(rows, results, strict=True)
+                if res is not None and is_infrastructure_error(res)
+            }
             if ok:
                 await conn.execute("UPDATE outbox SET published_at = now() WHERE id = ANY($1)", ok)
             for outbox_id, err in bad:
+                # Only message-specific failures count toward the poison cap. A broker outage
+                # is not the message's fault: it keeps retrying until the broker is back.
+                counts = 0 if outbox_id in infra_failed else 1
                 await conn.execute(
-                    "UPDATE outbox SET attempts = attempts + 1, last_error = $2 WHERE id = $1",
-                    outbox_id, err[:500],
+                    "UPDATE outbox SET attempts = attempts + $3, last_error = $2 WHERE id = $1",
+                    outbox_id, err[:500], counts,
                 )  # fmt: skip
                 metrics.OUTBOX_FAILURES.inc()
                 log.error("publish failed", extra={"outbox_id": outbox_id, "error": err[:200]})
