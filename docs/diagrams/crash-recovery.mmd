@@ -1,0 +1,18 @@
+sequenceDiagram
+  autonumber
+  participant A as Worker A
+  participant PG as PostgreSQL
+  participant R as Reaper
+  participant B as Worker B
+  participant X as Effect receiver
+  A->>PG: claim job (lease 30s, attempt 1)
+  A->>X: deliver(job:effect) → first delivery
+  Note over A: SIGKILL / freeze / node lost
+  R->>PG: lease expired → retry_scheduled → queued
+  B->>PG: claim job (attempt 2, new fencing token)
+  B->>X: deliver(job:effect) → duplicate, absorbed
+  B->>PG: complete (token 2) ✔
+  opt A was only frozen and wakes up
+    A->>PG: complete (token 1) ✘ rejected: stale fencing token
+  end
+  Note over PG,X: one outcome, one effect, deliveries ≤ attempts

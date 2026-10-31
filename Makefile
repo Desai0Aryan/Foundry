@@ -58,6 +58,12 @@ test-chaos: ## Slow end-to-end fault-injection tests
 test: ## Run unit + integration tests (needs FOUNDRY_TEST_DATABASE_URL or local Postgres)
 	$(PY) -m pytest
 
+k8s-validate: ## Render kustomize overlays and validate against the Kubernetes schema
+	python3 scripts/validate_k8s.py
+
+k8s-dev: ## Deploy to the current kube context (kind/minikube) with throwaway deps
+	kubectl apply -k deploy/k8s/overlays/dev
+
 lint: ## Lint and format-check
 	ruff check src tests scripts ops && ruff format --check src tests scripts ops
 

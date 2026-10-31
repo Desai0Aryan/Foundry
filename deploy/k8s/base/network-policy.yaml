@@ -1,0 +1,41 @@
+# Default deny, then allow exactly what the platform needs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny, namespace: foundry }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: foundry-egress, namespace: foundry }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: foundry }
+  policyTypes: [Egress]
+  egress:
+    - to: [{ namespaceSelector: {}, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+      ports: [{ port: 53, protocol: UDP }, { port: 53, protocol: TCP }]
+    - to: [{ podSelector: { matchLabels: { app.kubernetes.io/part-of: foundry-deps } } }]
+      ports: [{ port: 5432 }, { port: 6379 }, { port: 5672 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: foundry-api-ingress, namespace: foundry }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/component: api }
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{ port: 8000 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: foundry-metrics-ingress, namespace: foundry }
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: foundry }
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } } }]
+      ports: [{ port: 9100 }, { port: 9101 }, { port: 9102 }, { port: 8000 }]

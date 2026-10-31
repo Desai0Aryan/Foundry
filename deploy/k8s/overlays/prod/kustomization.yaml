@@ -1,0 +1,18 @@
+# Production: managed PostgreSQL/Redis/RabbitMQ, secrets from your secret manager.
+# 1. Remove the example Secret (it is only a placeholder) and provide `foundry-secrets` yourself.
+# 2. Pin the image by digest.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: foundry
+    newName: ghcr.io/YOUR_ORG/foundry
+    newTag: "0.5.0"
+patches:
+  - target: { kind: ConfigMap, name: foundry-config }
+    patch: |-
+      - { op: replace, path: /data/FOUNDRY_WORKER_CONCURRENCY, value: "16" }
+  - target: { kind: Ingress, name: foundry }
+    patch: |-
+      - { op: replace, path: /spec/rules/0/host, value: jobs.YOUR_DOMAIN.com }

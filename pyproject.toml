@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "foundry"
-version = "0.4.0"
+version = "0.5.0"
 description = "Foundry: a production-style distributed job processing platform (Postgres + RabbitMQ + Redis)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -57,6 +57,6 @@ ignore = ["S101", "B008", "RUF012"]
 "src/foundry/audit.py" = ["E501", "S608"]  # scope fragments are static, values are bound
 "src/foundry/tools/**" = ["E501", "S311", "S110", "BLE001", "S603"]
 "src/foundry/handlers.py" = ["E501"]
-"scripts/**" = ["E501", "S311", "S310", "S603", "S607", "RUF059", "B007"]
+"scripts/**" = ["S603", "S607", "E501", "S311", "S310", "S603", "S607", "RUF059", "B007"]
 "ops/**" = ["E501", "RUF012"]
 "tests/**" = ["S105", "S106", "E501", "ASYNC109", "ASYNC220", "S603"]

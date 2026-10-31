@@ -1,0 +1,20 @@
+# Optional (needs KEDA). Scale workers on what actually matters, the backlog, not CPU.
+# Replaces the CPU HPA in base/worker.yaml (delete that HPA when you adopt this).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: foundry-worker
+  namespace: foundry
+spec:
+  scaleTargetRef: { name: foundry-worker }
+  minReplicaCount: 3
+  maxReplicaCount: 50
+  cooldownPeriod: 300
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        # queued jobs per worker slot. DB-derived gauges are exported by every API replica,
+        # so aggregate with max(), not sum().
+        query: max(foundry_jobs{status="queued"}) / clamp_min(max(foundry_worker_slots{state="total"}), 1)
+        threshold: "1"

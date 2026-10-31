@@ -1,0 +1,75 @@
+# Workers are the scalable, disposable part. They can be SIGKILLed at any time: leases +
+# fencing recover their jobs. SIGTERM (rollouts, scale-down, node drain) is graceful: stop
+# claiming, finish or release in-flight jobs without burning an attempt.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: foundry-worker
+  namespace: foundry
+  labels: { app.kubernetes.io/name: foundry, app.kubernetes.io/component: worker }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app.kubernetes.io/name: foundry, app.kubernetes.io/component: worker }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 1, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: foundry, app.kubernetes.io/component: worker }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: { type: RuntimeDefault }
+      terminationGracePeriodSeconds: 60  # > FOUNDRY_SHUTDOWN_GRACE_SECONDS
+      containers:
+        - name: worker
+          image: foundry:latest
+          imagePullPolicy: IfNotPresent
+          command: ["foundry", "worker"]
+          ports: [{ name: metrics, containerPort: 9100 }]
+          envFrom:
+            - configMapRef: { name: foundry-config }
+            - secretRef: { name: foundry-secrets }
+          resources:
+            requests: { cpu: 500m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          livenessProbe:
+            httpGet: { path: /metrics, port: metrics }
+            periodSeconds: 15
+            failureThreshold: 4
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: foundry-worker
+  namespace: foundry
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: foundry-worker }
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # don't flap; scale-down is graceful but not free
+      policies: [{ type: Pods, value: 2, periodSeconds: 60 }]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: foundry-worker
+  namespace: foundry
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: foundry, app.kubernetes.io/component: worker }

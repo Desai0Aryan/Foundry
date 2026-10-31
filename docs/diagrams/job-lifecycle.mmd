@@ -1,0 +1,14 @@
+stateDiagram-v2
+  [*] --> queued: submit (outbox written atomically)
+  queued --> running: claim (lease + attempt++ = fencing token)
+  queued --> cancelled: cancel
+  running --> succeeded: complete (guarded by lease owner + token)
+  running --> retry_scheduled: transient error or lease expired (reaper), attempts left
+  running --> dead: permanent error or attempts exhausted
+  running --> queued: graceful SIGTERM release (no attempt burned)
+  running --> cancelled: cancel observed at heartbeat
+  retry_scheduled --> queued: next_run_at reached (exponential backoff + jitter)
+  retry_scheduled --> cancelled: cancel
+  dead --> queued: replay
+  succeeded --> [*]
+  cancelled --> [*]

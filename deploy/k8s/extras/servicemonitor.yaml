@@ -1,0 +1,11 @@
+# Optional (needs prometheus-operator). Scrapes api, workers, relay and reaper.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: foundry
+  namespace: foundry
+spec:
+  selector: { matchLabels: { app.kubernetes.io/name: foundry } }
+  podMetricsEndpoints:
+    - { port: metrics, interval: 15s }
+    - { port: http, path: /metrics, interval: 15s }

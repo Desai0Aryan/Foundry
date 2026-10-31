@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: foundry-config
+  namespace: foundry
+data:
+  FOUNDRY_LOG_JSON: "true"
+  # Crash-recovery latency is roughly the lease. Heartbeat = lease / 3.
+  FOUNDRY_LEASE_SECONDS: "30"
+  FOUNDRY_HEARTBEAT_SECONDS: "10"
+  FOUNDRY_WORKER_CONCURRENCY: "8"
+  # Must be < terminationGracePeriodSeconds in the worker Deployment.
+  FOUNDRY_SHUTDOWN_GRACE_SECONDS: "40"
+---
+# Example only. In real clusters create this from your secret manager
+# (External Secrets, Sealed Secrets, Vault...) and never commit real values.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: foundry-secrets
+  namespace: foundry
+type: Opaque
+stringData:
+  FOUNDRY_DATABASE_URL: postgresql://foundry:CHANGE_ME@postgres:5432/foundry
+  FOUNDRY_BROKER_URL: amqp://foundry:CHANGE_ME@rabbitmq:5672/
+  FOUNDRY_REDIS_URL: redis://redis:6379/0
+  FOUNDRY_ADMIN_TOKEN: CHANGE_ME
+  FOUNDRY_API_KEY_PEPPER: CHANGE_ME

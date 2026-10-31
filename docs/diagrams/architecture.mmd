@@ -1,0 +1,24 @@
+flowchart TB
+  client([Client]) -->|"POST /v1/jobs + Idempotency-Key"| api
+  subgraph cp["Control plane: stateless, N replicas"]
+    api["API<br/>auth, rate limit, quota"]
+    relay["Outbox relay"]
+    reaper["Reaper<br/>lease recovery, retries"]
+  end
+  pg[("PostgreSQL<br/>source of truth")]
+  redis[("Redis<br/>limits and quotas")]
+  mq{{"RabbitMQ<br/>delivery hints"}}
+  workers["Workers x N<br/>disposable, autoscaled"]
+  sink[("External effect<br/>idempotent receiver")]
+  obs["Prometheus + Grafana"]
+  api -->|"one txn: job + event + outbox"| pg
+  api --> redis
+  pg -.->|"LISTEN/NOTIFY"| relay
+  relay -->|"publish with confirms"| mq
+  mq --> workers
+  workers -->|"lease, heartbeat, complete (fenced)"| pg
+  workers -->|"job_id:effect_key"| sink
+  reaper -->|"recover, promote, redrive"| pg
+  mq -.->|"poison / dead"| dlq[("DLQ")]
+  obs -.->|scrape| api
+  obs -.->|scrape| workers

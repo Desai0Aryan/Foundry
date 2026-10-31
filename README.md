@@ -28,11 +28,13 @@ Most "AI demos" are a model behind an endpoint. Real systems are mostly **failur
 |-----:|-------|:------:|
 | 1 | Schema, auth, REST API, idempotency, dedup, transactional outbox, Docker stack | ✅ done |
 | 2 | Workers, RabbitMQ, retries + exponential backoff, timeouts, dead-letter queue, lease reaper, crash recovery | ✅ done |
-| 3 | Rate limiting, per-user quotas, Prometheus metrics, Grafana dashboards | ✅ **done** |
-| 4 | Load tests, chaos / worker-crash recovery tests, exactly-once-effect proof | ⏳ |
-| 5 | Kubernetes manifests, CI polish, architecture docs, final demo | ⏳ |
+| 3 | Rate limiting, per-user quotas, Prometheus metrics, Grafana dashboards | ✅ done |
+| 4 | Open-loop load tests, chaos / worker-crash recovery tests, invariant auditor | ✅ done |
+| 5 | Kubernetes (kustomize, HPA, PDB, NetworkPolicy), CI, architecture docs | ✅ **done** |
 
 ## Architecture
+
+Deep dive with sequence and state diagrams: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```mermaid
 flowchart LR
@@ -226,3 +228,28 @@ make test-chaos                       # the same, as pytest (real processes, rea
 Scenarios: `worker-crash`, `worker-freeze`, `rolling-restart`, `control-plane-crash`,
 `broker-outage`, `kitchen-sink`. Each ends with an audit; a violation exits non-zero.
 Results and caveats: [docs/PERFORMANCE.md](docs/PERFORMANCE.md). Design: [ADR 0008](docs/adr/0008-prove-dont-claim.md).
+
+
+## Kubernetes (Part 5)
+
+```bash
+make k8s-validate      # render all overlays with kustomize, validate against the Kubernetes 1.30 schema
+make k8s-dev           # kubectl apply -k deploy/k8s/overlays/dev  (kind/minikube, throwaway deps)
+```
+
+`deploy/k8s/base` has the API, workers, relay and reaper with probes, HPAs, PodDisruptionBudgets,
+restricted pod security and default-deny NetworkPolicies. `overlays/prod` expects managed
+PostgreSQL/Redis/RabbitMQ; `extras/` has a KEDA backlog-based autoscaler and a PodMonitor.
+See [ADR 0009](docs/adr/0009-kubernetes-deployment.md).
+
+## The 3-minute portfolio demo
+
+1. `make up` (or `docker compose up --build`) and open Grafana on :3000.
+2. `make chaos SCENARIO=kitchen-sink`: load runs while a worker is SIGKILLed, a zombie wakes up after its lease was taken, relay and reaper are killed and RabbitMQ goes down.
+3. Read the verdict: `ALL INVARIANTS HELD`, every acknowledged job succeeded, one effect per job.
+
+## Honest limits
+
+- Docker Compose and the Kubernetes manifests were never run against a real Docker daemon or cluster in development (the sandbox had neither). Manifests are schema-validated only; the Python stack was exercised end to end locally.
+- Performance numbers come from a 2-vCPU box running everything including the load generator ([docs/PERFORMANCE.md](docs/PERFORMANCE.md)).
+- Redis is fail-open for rate limiting by design (availability over strictness).

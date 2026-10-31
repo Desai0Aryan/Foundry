@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - deps.yaml
+patches:
+  # single replicas and no autoscaling noise on a laptop cluster
+  - target: { kind: Deployment, name: foundry-api }
+    patch: |-
+      - { op: replace, path: /spec/replicas, value: 1 }
+  - target: { kind: Deployment, name: "foundry-(relay|reaper)" }
+    patch: |-
+      - { op: replace, path: /spec/replicas, value: 1 }
+  - target: { kind: Deployment, name: foundry-worker }
+    patch: |-
+      - { op: replace, path: /spec/replicas, value: 2 }
+  - target: { kind: Ingress, name: foundry }
+    patch: |-
+      - { op: replace, path: /spec/rules/0/host, value: foundry.localtest.me }
